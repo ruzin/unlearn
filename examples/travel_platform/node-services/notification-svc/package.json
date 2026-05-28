@@ -1,0 +1,7 @@
+{
+  "name": "notification-svc",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": { "@travel/ts-common": "0.1.0", "express": "^4.19.0" }
+}

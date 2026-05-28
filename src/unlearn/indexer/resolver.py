@@ -45,14 +45,51 @@ _PY_EXTS = (".py",)
 _TS_EXTS = (".ts", ".tsx", ".js", ".jsx")
 
 
+def compute_python_source_roots(known_files: set[str]) -> list[str]:
+    """Derive Python package source roots from __init__.py placement.
+
+    A "source root" is a directory where absolute imports can be resolved
+    against — the parent of the topmost contiguous chain of __init__.py
+    directories. For a flat layout (no nesting) this is the indexed root;
+    for monorepos with services under services/<svc>/app/ this is each
+    service directory.
+
+    Returns the indexed root ("") first, then deeper roots sorted by depth
+    so nearer-to-the-importer matches can be tried in order.
+    """
+    init_dirs = {
+        str(PurePosixPath(f).parent)
+        for f in known_files
+        if f.endswith("/__init__.py") or f == "__init__.py"
+    }
+    roots: set[str] = {""}  # indexed root always counts (preserves flat-layout behaviour)
+    for d in init_dirs:
+        # Walk up while the parent also has an __init__.py — find the top of the package chain.
+        cur = d
+        while True:
+            parent = str(PurePosixPath(cur).parent)
+            if parent in (".", "") or parent == cur:
+                roots.add("")
+                break
+            if parent in init_dirs:
+                cur = parent
+                continue
+            roots.add(parent)
+            break
+    return sorted(roots, key=lambda r: r.count("/"))
+
+
 def resolve_python_import(
     importer_file: str,
     stmt: ImportStatement,
     known_files: set[str],
+    source_roots: list[str] | None = None,
 ) -> str | None:
     """Resolve a Python import to a file in the project.
 
     Returns the target file path (project-relative) or None if external/stdlib.
+    For absolute imports, each entry in `source_roots` is tried as a prefix —
+    this is how monorepos with per-package source roots get resolved.
     """
     if stmt.is_relative:
         importer_dir = str(PurePosixPath(importer_file).parent)
@@ -63,34 +100,44 @@ def resolve_python_import(
         base = "/".join(p for p in parts if p)
         module_parts = stmt.module.split(".") if stmt.module else []
         target_parts = [p for p in (base.split("/") if base else []) + module_parts if p]
+        prefixes: list[str] = [""]  # already path-rooted
     else:
         if not stmt.module:
             return None
         target_parts = stmt.module.split(".")
+        # For absolute imports, try the importer's own source root first
+        # (deepest matching prefix), then any other roots.
+        all_roots = source_roots if source_roots is not None else [""]
+        importer_dir = str(PurePosixPath(importer_file).parent)
+        own_roots = [r for r in all_roots if r == "" or importer_dir == r or importer_dir.startswith(r + "/")]
+        other_roots = [r for r in all_roots if r not in own_roots]
+        # Nearest source root to the importer goes first.
+        own_roots.sort(key=lambda r: -len(r))
+        prefixes = own_roots + other_roots
 
     if not target_parts:
         return None
 
-    # Try as a module file.
-    candidate_module = "/".join(target_parts) + ".py"
-    if candidate_module in known_files:
-        return candidate_module
+    suffix_module = "/".join(target_parts) + ".py"
+    suffix_pkg = "/".join(target_parts) + "/__init__.py"
+    parent_target = "/".join(target_parts[:-1]) if len(target_parts) >= 2 else None
+    last_part = target_parts[-1] if target_parts else None
 
-    # Try as a package (__init__.py).
-    candidate_pkg = "/".join(target_parts) + "/__init__.py"
-    if candidate_pkg in known_files:
-        return candidate_pkg
-
-    # Maybe the import targets a symbol inside a module:
-    # `from foo.bar import baz` where bar.py defines baz — already covered above.
-    # `from foo import bar` where bar is a module under foo/.
-    if len(target_parts) >= 2:
-        candidate_submodule = "/".join(target_parts[:-1]) + "/" + target_parts[-1] + ".py"
-        if candidate_submodule in known_files:
-            return candidate_submodule
-        candidate_subpkg = "/".join(target_parts[:-1]) + "/" + target_parts[-1] + "/__init__.py"
-        if candidate_subpkg in known_files:
-            return candidate_subpkg
+    for prefix in prefixes:
+        base = (prefix + "/") if prefix else ""
+        cand = base + suffix_module
+        if cand in known_files:
+            return cand
+        cand = base + suffix_pkg
+        if cand in known_files:
+            return cand
+        if parent_target is not None and last_part is not None:
+            cand = base + parent_target + "/" + last_part + ".py"
+            if cand in known_files:
+                return cand
+            cand = base + parent_target + "/" + last_part + "/__init__.py"
+            if cand in known_files:
+                return cand
 
     return None
 
@@ -160,6 +207,7 @@ def build_graph_edges(
     file_indexes: dict[str, _FileIndex] = {
         e.file_path: _build_file_index(e) for e in extractions
     }
+    py_source_roots = compute_python_source_roots(known_files)
 
     # First pass: emit File nodes + entity nodes + CONTAINS edges.
     for ex in extractions:
@@ -213,7 +261,7 @@ def build_graph_edges(
         symbol_map: dict[str, tuple[str, str | None]] = {}
         file_symbol_map[ex.file_path] = symbol_map
         for stmt in ex.imports:
-            target_file = _resolve_import(ex, stmt, known_files)
+            target_file = _resolve_import(ex, stmt, known_files, py_source_roots)
             if target_file is None:
                 continue
             edges.append(
@@ -305,9 +353,12 @@ def _resolve_import(
     extraction: FileExtraction,
     stmt: ImportStatement,
     known_files: set[str],
+    py_source_roots: list[str],
 ) -> str | None:
     if extraction.language == "python":
-        return resolve_python_import(extraction.file_path, stmt, known_files)
+        return resolve_python_import(
+            extraction.file_path, stmt, known_files, py_source_roots
+        )
     return resolve_ts_import(extraction.file_path, stmt, known_files)
 
 
